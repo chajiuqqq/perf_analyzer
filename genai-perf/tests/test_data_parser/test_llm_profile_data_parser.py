@@ -365,6 +365,46 @@ class TestLLMProfileDataParser:
         ],
     }
 
+    openai_reasoning_profile_data = {
+        "service_kind": "openai",
+        "endpoint": "v1/chat/completions",
+        "experiments": [
+            {
+                "experiment": {
+                    "mode": "concurrency",
+                    "value": 10,
+                },
+                "requests": [
+                    {
+                        "timestamp": 1,
+                        "request_inputs": {
+                            "payload": '{"messages":[{"role":"user","content":"This is test"}],"model":"llama-2-7b","stream":true}',
+                        },
+                        "response_timestamps": [3, 5, 8, 12, 13, 14],
+                        "response_outputs": [
+                            {
+                                "response": 'data: {"id":"abc","object":"chat.completion.chunk","created":123,"model":"llama-2-7b","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'
+                            },
+                            {
+                                "response": 'data: {"id":"abc","object":"chat.completion.chunk","created":123,"model":"llama-2-7b","choices":[{"index":0,"delta":{"reasoning":"I"},"finish_reason":null}]}\n\n'
+                            },
+                            {
+                                "response": 'data: {"id":"abc","object":"chat.completion.chunk","created":123,"model":"llama-2-7b","choices":[{"index":0,"delta":{"reasoning_content":" like"},"finish_reason":null}]}\n\n'
+                            },
+                            {
+                                "response": 'data: {"id":"abc","object":"chat.completion.chunk","created":123,"model":"llama-2-7b","choices":[{"index":0,"delta":{"thinking":" dogs"},"finish_reason":null}]}\n\n'
+                            },
+                            {
+                                "response": 'data: {"id":"abc","object":"chat.completion.chunk","created":123,"model":"llama-2-7b","choices":[{"index":0,"delta":{"content":" too"},"finish_reason":null}]}\n\n'
+                            },
+                            {"response": "data: [DONE]\n\n"},
+                        ],
+                    },
+                ],
+            },
+        ],
+    }
+
     @patch(
         "genai_perf.profile_data_parser.profile_data_parser.load_json",
         return_value=openai_profile_data,
@@ -443,6 +483,49 @@ class TestLLMProfileDataParser:
         # check non-existing profile data
         with pytest.raises(KeyError):
             pd.get_statistics(infer_mode="concurrency", load_level="40")
+
+    @patch(
+        "genai_perf.profile_data_parser.profile_data_parser.load_json",
+        return_value=openai_reasoning_profile_data,
+    )
+    def test_openai_reasoning_llm_profile_data(self, mock_json) -> None:
+        config = ConfigCommand({"model_name": "test_model"})
+        config.tokenizer.name = "hf-internal-testing/llama-tokenizer"
+        tokenizer = get_tokenizer(config)
+        pd = LLMProfileDataParser(
+            filename=Path("openai_reasoning_profile_export.json"),
+            tokenizer=tokenizer,
+        )
+
+        statistics = pd.get_statistics(infer_mode="concurrency", load_level="10")
+        metrics = cast(LLMMetrics, statistics.metrics)
+
+        output_texts = ["I", " like", " dogs", " too"]
+        output_token_counts = pd._get_output_token_counts_batch(output_texts)
+        total_output_token = pd._cached_encode("".join(output_texts))
+        inter_token_latency = round((11 - 2) / (total_output_token - 1))
+        expected_chunked_itl = [
+            round((t2 - t1) / (1 if n2 == 0 else n2))
+            for (t1, t2), n2 in zip(
+                [(3, 5), (5, 8), (8, 12)], output_token_counts[1:]
+            )
+        ]
+        expected_metrics = LLMMetrics(
+            request_latencies=[11],
+            request_throughputs=[1 / ns_to_sec(11)],
+            time_to_first_tokens=[2],
+            time_to_second_tokens=[2],
+            inter_token_latencies=[inter_token_latency],
+            output_token_throughputs=[total_output_token / ns_to_sec(11)],
+            output_token_throughputs_per_user=[1 / ns_to_sec(inter_token_latency)],
+            output_sequence_lengths=[total_output_token],
+            input_sequence_lengths=[3],
+            chunked_inter_token_latencies=[expected_chunked_itl],
+        )
+        expected_statistics = Statistics(expected_metrics)
+
+        check_llm_metrics(metrics, expected_metrics)
+        check_statistics(statistics, expected_statistics)
 
     ###############################
     # OPENAI VISION
@@ -1001,6 +1084,21 @@ class TestLLMProfileDataParser:
                 ],
                 '{"choices":[{"delta":{"content":"abc1234helloworld"}}],"object":"chat.completion.chunk"}',
             ),
+            (
+                openai_reasoning_profile_data,
+                [
+                    {
+                        "response": (
+                            'data: {"choices":[{"delta":{"reasoning":"abc"}}],"object":"chat.completion.chunk"}\n\n'
+                            'data: {"choices":[{"delta":{"reasoning_content":"123"}}],"object":"chat.completion.chunk"}\n\n'
+                            'data: {"choices":[{"delta":{"thinking":"hello"}}],"object":"chat.completion.chunk"}\n\n'
+                            'data: {"choices":[{"delta":{"content":"world"}}],"object":"chat.completion.chunk"}\n\n'
+                        )
+                    },
+                    {"response": "data: [DONE]\n\n"},
+                ],
+                '{"choices":[{"delta":{"reasoning":"abc","reasoning_content":"123","thinking":"hello","content":"world"}}],"object":"chat.completion.chunk"}',
+            ),
         ],
     )
     def test_merged_sse_responses(
@@ -1410,6 +1508,11 @@ class TestLLMProfileDataParser:
             ),
             (
                 ResponseFormat.OPENAI_CHAT_COMPLETIONS,
+                '{"object":"chat.completion.chunk","choices":[{"delta":{"reasoning":"Think","reasoning_content":" More","thinking":" Deeply","content":" Answer"}}]}',
+                "Think More Deeply Answer",
+            ),
+            (
+                ResponseFormat.OPENAI_CHAT_COMPLETIONS,
                 '{"choices":[{"text":"Fallback"}]}',
                 "Fallback",
             ),
@@ -1447,6 +1550,21 @@ class TestLLMProfileDataParser:
             (
                 ResponseFormat.OPENAI_CHAT_COMPLETIONS,
                 '{"object":"chat.completion","choices":[{"message":{"content":"Hello"}}]}',
+                False,
+            ),
+            (
+                ResponseFormat.OPENAI_CHAT_COMPLETIONS,
+                '{"object":"chat.completion.chunk","choices":[{"delta":{"reasoning":"Hello"}}]}',
+                False,
+            ),
+            (
+                ResponseFormat.OPENAI_CHAT_COMPLETIONS,
+                '{"object":"chat.completion.chunk","choices":[{"delta":{"reasoning_content":"Hello"}}]}',
+                False,
+            ),
+            (
+                ResponseFormat.OPENAI_CHAT_COMPLETIONS,
+                '{"object":"chat.completion.chunk","choices":[{"delta":{"thinking":"Hello"}}]}',
                 False,
             ),
             (ResponseFormat.OPENAI_CHAT_COMPLETIONS, "", True),

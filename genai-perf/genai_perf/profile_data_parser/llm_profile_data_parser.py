@@ -29,7 +29,7 @@
 from collections import defaultdict
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, NoReturn, Tuple, TypeAlias
+from typing import Any, Dict, List, NoReturn, Tuple, TypeAlias
 
 import orjson
 from genai_perf.constants import DEFAULT_LRU_CACHE_SIZE, EMPTY_RESPONSE_TOKEN
@@ -53,6 +53,12 @@ from tqdm import tqdm
 logger = logging.getLogger(__name__)
 
 SessionMetrics: TypeAlias = Dict[str, Dict[str, List[float | int]]]
+OPENAI_CHAT_STREAM_TEXT_FIELDS = (
+    "reasoning",
+    "reasoning_content",
+    "thinking",
+    "content",
+)
 
 
 class LLMProfileDataParser(ProfileDataParser):
@@ -368,16 +374,18 @@ class LLMProfileDataParser(ProfileDataParser):
                             if isinstance(data, list) and len(data) > 0:
                                 data[0]["generated_text"] = merged_text  # type: ignore
                         else:
-                            merged_text = "".join(
-                                [self._extract_text_output(r) for r in responses]
-                            )
                             if (
                                 self._response_format
                                 == ResponseFormat.OPENAI_COMPLETIONS
                             ):
+                                merged_text = "".join(
+                                    [self._extract_text_output(r) for r in responses]
+                                )
                                 data["choices"][0]["text"] = merged_text
                             else:
-                                data["choices"][0]["delta"]["content"] = merged_text
+                                data = self._merge_openai_chat_sse_responses(
+                                    responses, data
+                                )
                         res_outputs[i] = {
                             "response": orjson.dumps(data).decode("utf-8")
                         }
@@ -552,9 +560,34 @@ class LLMProfileDataParser(ProfileDataParser):
         elif obj_type == "chat.completion":  # non-streaming
             return completions["message"].get("content", "")
         elif obj_type == "chat.completion.chunk":  # streaming
-            return completions["delta"].get("content", "")
+            return self._extract_openai_chat_delta_text(completions.get("delta", {}))
         else:
             raise ValueError(f"Unknown OpenAI response object type '{obj_type}'.")
+
+    def _extract_openai_chat_delta_text(self, delta: Dict[str, Any]) -> str:
+        return "".join(
+            value for field in OPENAI_CHAT_STREAM_TEXT_FIELDS if (value := delta.get(field))
+        )
+
+    def _merge_openai_chat_sse_responses(self, responses: List[str], data: Any) -> Any:
+        merged_delta: Dict[str, str] = {}
+        for field in OPENAI_CHAT_STREAM_TEXT_FIELDS:
+            merged_text = "".join(
+                self._extract_openai_chat_delta_field(r, field) for r in responses
+            )
+            if merged_text:
+                merged_delta[field] = merged_text
+
+        if merged_delta:
+            data["choices"][0]["delta"] = merged_delta
+        return data
+
+    def _extract_openai_chat_delta_field(self, response: str, field: str) -> str:
+        data = load_json_str(remove_sse_prefix(response))
+        completions = data.get("choices", [{}])[0]
+        delta = completions.get("delta", {})
+        value = delta.get(field, "")
+        return value if isinstance(value, str) else ""
 
     def _extract_openai_completion_text_output(self, response: str) -> str:
         """Extract text from OpenAI completion response."""
